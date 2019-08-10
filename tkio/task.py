@@ -97,17 +97,17 @@ async def schedule():
 async def wait_event():
     await _wait_event()
 
-async def pop_event(*, blocking=True):
+async def pop_event(widget=None, *, blocking=True):
     if not blocking:
-        return await _pop_event()
+        return await _pop_event(widget)
     while True:
         try:
-            return await _pop_event()
+            return await _pop_event(widget)
         except NoEvent:
             await _wait_event()
 
-async def get_events():
-    return await _get_events()
+async def get_events(widget=None):
+    return await _get_events(widget)
 
 async def clear_events():
     await _clear_events()

@@ -21,6 +21,7 @@ def _act(*data):
     return result
 
 # Specialized acts
+# (These are the coroutine side of acts)
 async def _get_time():
     return await _act("get_time")
 
@@ -30,11 +31,11 @@ async def _sleep(tm, /):
 async def _wait_event():
     await _act("wait_event")
 
-async def _pop_event():
-    return await _act("pop_event")
+async def _pop_event(widget=None, /):
+    return await _act("pop_event", widget)
 
-async def _get_events():
-    return await _act("_get_events")
+async def _get_events(widget=None, /):
+    return await _act("_get_events", widget)
 
 async def _clear_events():
     await _act("clear_events")
