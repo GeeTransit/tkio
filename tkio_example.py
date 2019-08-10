@@ -1,13 +1,12 @@
+import random
 import tkinter
 from tkinter import colorchooser
 
 import tkio
 
-events = []
-errors = []
 
-async def test(wait):
-    import random
+
+async def test():
 
     tk = await tkio.get_tk()
     canvas = tkinter.Canvas(tk, highlightthickness=0)
@@ -28,7 +27,6 @@ async def test(wait):
 
         while True:
             e = await tkio.pop_event()
-            events.append(e)
             et = str(e.type)
             if et in {"Motion", "Enter"}:
                 if x is None:
@@ -54,13 +52,8 @@ async def test(wait):
 
     except tkio.CloseWindow:
         pass
-    if wait:
-        while True:
-            await tkio.sleep(5)
 
 
 
 if __name__ == "__main__":
-    with tkio.TkLoop() as tkl:
-        tkl.run(tkio.new_task(test(True)))
-        tkl.run(test(False))
+    tkio.run(test())

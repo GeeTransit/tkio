@@ -86,13 +86,21 @@ class TkLoop:
             def reschedule(task, /):
                 ready_tasks.append(task)
                 task.state = "READY"
-                task._cancel_func = None
+                task.cancel_func = None
 
             def suspend_current(state, cancel_func, /):
                 nonlocal running
                 current.state = state
-                current._cancel_func = cancel_func
+                current.cancel_func = cancel_func
                 running = False
+
+            def check_cancel():
+                if current.allow_cancel and current.cancel_pending:
+                    current._val = current.cancel_pending
+                    current.cancel_pending = None
+                    return True
+                else:
+                    return False
 
             def new_task(coro, /, *, eventless=False):
                 task = Task(coro, eventless=eventless)
@@ -101,14 +109,25 @@ class TkLoop:
                 return task
 
             def cancel_task(task, /, *, exc=TaskCancelled, val=None):
-                if cancel_func := task._cancel_func:
-                    cancel_func()
-                    task._cancel_func = None
-                task.state = "CANCELLED"
+                if task.cancelled:
+                    return
+
+                task.cancelled = True
+
                 if isinstance(exc, BaseException):
-                    task._val = exc
+                    task.cancel_pending = exc
                 else:
-                    task._val = exc(exc.__name__ if val is None else val)
+                    task.cancel_pending = exc(exc.__name__ if val is None else val)
+
+                if not task.allow_cancel:
+                    return
+
+                if not task.cancel_func:
+                    return
+
+                task.cancel_func()
+                task._val = task.cancel_pending
+                task.cancel_pending = None
                 reschedule(task)
 
             @contextlib.contextmanager
@@ -138,6 +157,9 @@ class TkLoop:
                 current._val = monotonic()
 
             def _act_sleep(tm):
+                if check_cancel():
+                    return
+
                 if tm > 0:
                     suspend_current("SLEEP", sleep_wait[monotonic() + tm].add(current))
                 else:
@@ -148,6 +170,8 @@ class TkLoop:
 
             @event_tasks_only
             def _act_wait_event():
+                if check_cancel():
+                    return
                 if not current.terminated:
                     suspend_current("EVENT_WAIT", event_wait.add(current))
 
@@ -184,6 +208,8 @@ class TkLoop:
                 cancel_task(task, exc=exc, val=val)
 
             def _act_wait_task(task):
+                if check_cancel():
+                    return
                 suspend_current("TASK_WAIT", task.waiting.add(current))
 
             def _act_get_tasks():
@@ -214,8 +240,7 @@ class TkLoop:
 
             def close_window():
                 for task in self._tasks.values():
-                    if task.state != "INITIAL":
-                        cancel_task(task, exc=CloseWindow("X was pressed"))
+                    cancel_task(task, exc=CloseWindow("X was pressed"))
                 safe_send(cycle, "CLOSE_WINDOW")
                 return "break"
 
@@ -276,18 +301,13 @@ class TkLoop:
 
                     for _ in range(len(ready_tasks)):
                         current = ready_tasks.popleft()
-                        if current.terminated:
-                            continue
                         current.state = "RUNNING"
                         running = True
 
                         while running:
 
                             try:
-                                if isinstance(current._val, BaseException):
-                                    act = current.coro.throw(current._val)
-                                else:
-                                    act = current.coro.send(current._val)
+                                act = current.coro.send(current._val)
 
                             except BaseException as e:
                                 running = False

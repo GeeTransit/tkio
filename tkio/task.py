@@ -21,8 +21,10 @@ class Task:
         self.terminated = False    # Flag for task termination
         self.waiting = SetHolder() # Tasks waiting for termination
         self.cancel_func = None    # Function invoked on cancellation
-        self.report_crash = True   # Flag to print task exception
-        self.daemon = False        # Flag to ignore result
+        self.cancel_pending = None # Exception raised on next blocking call
+        self.allow_cancel = True   # Task can be cancelled
+        self.report_crash = True   # Task exception will be printed
+        self.daemon = False        # Result won't be ignored
 
         # -1 to signify that task doesn't want events
         self._next_event = -1 if eventless else 0
@@ -117,3 +119,21 @@ async def new_task(coro, /, *, eventless=False):
     return await _new_task(coro, eventless=eventless)
 async def this_task():
     return await _this_task()
+
+
+
+class block_cancellation:
+
+    def __init__(self, /):
+        self.task = None
+        self.previous = None
+
+    async def __aenter__(self, /):
+        self.task = task = await _this_task()
+        self.previous = task.allow_cancel
+        task.allow_cancel = False
+
+    async def __aexit__(self, exc, val, tb, /):
+        self.task.allow_cancel = self.previous
+        self.task = None
+        self.previous = None

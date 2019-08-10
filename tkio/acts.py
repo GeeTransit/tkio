@@ -15,7 +15,10 @@ __all__ = [
 # This basic generator is the only way into the loop
 @coroutine
 def _act(*data):
-    return (yield data)
+    result = (yield data)
+    if isinstance(result, BaseException):
+        raise result
+    return result
 
 # Specialized acts
 async def _get_time():
