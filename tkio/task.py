@@ -35,7 +35,7 @@ class Task:
         self._val = None
 
     def __repr__(self, /):
-        coro = self._coro.__qualname__
+        coro = self.coro.__qualname__
         state = self.state
         id = self.id
         return f"<{type(self).__qualname__} {id=} {coro=!s} {state=!s}>"
@@ -102,7 +102,7 @@ async def pop_event(*, blocking=True):
         try:
             return await _pop_event()
         except NoEvent:
-            await schedule()
+            await _wait_event()
 
 async def get_events():
     return await _get_events()
@@ -113,5 +113,7 @@ async def clear_events():
 async def get_tk():
     return await _get_tk()
 
+async def new_task(coro, /, *, eventless=False):
+    return await _new_task(coro, eventless=eventless)
 async def this_task():
     return await _this_task()

@@ -42,14 +42,14 @@ async def _clear_events():
 async def _get_tk():
     return await _act("get_tk")
 
-async def _new_task(coro, /, *, eventless=False, daemon=True):
-    return await _act("new_task", coro, eventless, daemon)
+async def _new_task(coro, /, *, eventless=False):
+    return await _act("new_task", coro, eventless)
 
 async def _this_task():
     return await _act("this_task")
 
-async def _cancel_task(*, exc=TaskCancelled):
-    await _act("cancel_task", exc)
+async def _cancel_task(task, /, *, exc=TaskCancelled, val=None):
+    await _act("cancel_task", task, exc, val)
 
 async def _wait_task(task, /):
     await _act("wait_task", task)

@@ -51,22 +51,29 @@ class TkLoop:
         val = exc = None
 
         if shutdown:
-    
             if coro:
                 raise ValueError("Cannot supply `coro` and `shutdown` in same call")
 
-            cancel_tasks = self._tasks.values()
-            async def corofunc():
-                for task in cancel_tasks:
+            async def shutdown_coro():
+                for task in self._tasks.values():
                     await task.cancel(blocking=False)
 
             while self._tasks:
-                self._runner.send(corofunc())
+                print(self._tasks)
+                val, exc = self._runner.send(shutdown_coro())
+                if exc:
+                    print(repr(exc))
             self._runner.close()
             self._closed = True
 
         else:
-            val, exc = self._runner.send(coro)
+            try:
+                val, exc = self._runner.send(coro)
+            except BaseException as e:
+                print(f"loop stopped from {e!r}")
+                val, exc = None, e
+                self._runner.close()
+                self._closed = True
 
         if exc:
             raise exc
@@ -104,7 +111,7 @@ class TkLoop:
                         timeout = 0
                         data = "READY"
                     elif sleep_wait:
-                        timeout = (min(sleep_wait) - _get_time())*1000
+                        timeout = (min(sleep_wait) - monotonic())*1000
                         data = "SLEEP_WAKE"
                     with after(frame, timeout, lambda: send(cycle, data)):
                         yield
@@ -116,7 +123,8 @@ class TkLoop:
                 def _wrapper(*args, **kwargs):
                     if current._next_event == -1:
                         current._val = TaskEventless("Task is eventless")
-                    func(*args, **kwargs)
+                    else:
+                        func(*args, **kwargs)
                 return _wrapper
 
             def _act_get_time():
@@ -124,10 +132,11 @@ class TkLoop:
 
             def _act_sleep(tm):
                 if tm > 0:
-                    suspend_current("SLEEP", sleep_wait[_get_time() + tm].add(current))
+                    suspend_current("SLEEP", sleep_wait[monotonic() + tm].add(current))
                 else:
                     nonlocal running
                     running = False
+                    current._val = monotonic()
                     reschedule(current)
 
             @event_tasks_only
@@ -140,7 +149,7 @@ class TkLoop:
                 try:
                     event = event_queue[current._next_event]
                 except IndexError:
-                    current._val = NoEvent()
+                    current._val = NoEvent("No event available")
                 else:
                     current._next_event += 1
                     current._val = event
@@ -164,12 +173,15 @@ class TkLoop:
             def _act_this_task():
                 current._val = current
 
-            def _act_cancel_task(task, exc):
+            def _act_cancel_task(task, exc, val):
                 if cancel_func := task._cancel_func:
                     cancel_func()
                     task._cancel_func = None
                 task.state = "CANCELLED"
-                task._val = exc
+                if isinstance(exc, BaseException):
+                    task._val = exc
+                else:
+                    task._val = exc(exc.__name__ if val is None else val)
                 reschedule(task)
 
             def _act_wait_task(task):
@@ -203,7 +215,8 @@ class TkLoop:
 
             def close_window():
                 for task in self._tasks.values():
-                    _act_cancel_task(task, CloseWindow("X was pressed"))
+                    if task.state != "INITIAL":
+                        _act_cancel_task(task, CloseWindow("X was pressed"))
                 safe_send(cycle, "CLOSE_WINDOW")
                 return "break"
 
@@ -243,8 +256,8 @@ class TkLoop:
                         info = await _suspend()
 
                     if info == "EVENT_WAKE":
-                        for etask in event_wait.popall():
-                            reschedule(etask)
+                        for task in event_wait.popall():
+                            reschedule(task)
 
                     # check for amount of events that have been consumed by all tasks
                     if event_tasks := [task for task in self._tasks.values() if task._next_event != -1]:
@@ -258,7 +271,7 @@ class TkLoop:
                     for tm in list(sleep_wait.keys()):
                         if tm <= now:
                             for tid in sleep_wait.pop(tm).popall():
-                                if (task := tasks.get(tid)):
+                                if (task := self._tasks.get(tid)):
                                     task._val = now
                                     reschedule(task)
 
@@ -277,8 +290,8 @@ class TkLoop:
                             except BaseException as e:
                                 running = False
 
-                                for wtask in current.waiting.popall():
-                                    reschedule(wtask)
+                                for task in current.waiting.popall():
+                                    reschedule(task)
                                 current.state = "TERMINATED"
                                 current.terminated = True
                                 del self._tasks[current.id]
@@ -403,6 +416,8 @@ class TkLoop:
                 destroy(frame)
                 if isinstance(e, StopIteration):
                     val, exc = e.value
+                elif isinstance(e, StopAsyncIteration):
+                    val, exc = None, None
                 else:
                     val, exc = None, e
 
@@ -415,7 +430,7 @@ class TkLoop:
                 while exists(tk):
                     coro = yield val, exc
                     cycle = wrap_coro(loop.asend(coro))
-                    del main_coro
+                    del coro
                     with destroying(tkinter.Frame(tk)) as frame:
                         send(cycle, None)
                         wait_window(frame)

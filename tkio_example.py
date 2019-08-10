@@ -1,13 +1,13 @@
 import tkinter
+from tkinter import colorchooser
 
 import tkio
 
 events = []
 errors = []
 
-async def test():
+async def test(wait):
     import random
-    from tkinter import colorchooser
 
     tk = await tkio.get_tk()
     canvas = tkinter.Canvas(tk, highlightthickness=0)
@@ -54,8 +54,14 @@ async def test():
 
     except tkio.CloseWindow:
         pass
+    if wait:
+        while True:
+            await tkio.sleep(5)
 
 
 
 if __name__ == "__main__":
-    tkio.run(test())
+    with tkio.TkLoop() as tkl:
+        tkl.run(tkio.new_task(test(True)))
+        tkl.run(test(False))
+        print("==closing==")
