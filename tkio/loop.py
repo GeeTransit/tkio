@@ -404,7 +404,6 @@ class TkLoop:
                 if isinstance(e, StopIteration):
                     val, exc = e.value
                 else:
-                    breakpoint()
                     val, exc = None, e
 
         val = exc = None
@@ -414,8 +413,8 @@ class TkLoop:
         with destroying(tkinter.Tk()) as tk:
             with prepare_loop() as loop:
                 while exists(tk):
-                    main_coro = yield val, exc
-                    cycle = wrap_coro(loop.asend(main_coro))
+                    coro = yield val, exc
+                    cycle = wrap_coro(loop.asend(coro))
                     del main_coro
                     with destroying(tkinter.Frame(tk)) as frame:
                         send(cycle, None)
