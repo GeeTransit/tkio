@@ -6,12 +6,11 @@ import tkio
 
 
 
-async def test():
+async def drawing_canvas():
 
     tk = await tkio.get_tk()
     canvas = tkinter.Canvas(tk, highlightthickness=0)
     canvas.pack(expand=True, fill="both")
-    last = None
 
     def random_colour():
         return "#" + "".join(hex(random.getrandbits(4) + 8)[2] for _ in range(6))
@@ -21,19 +20,22 @@ async def test():
         canvas["bg"] = colour
 
     x = y = None
+    last = None
     colour = random_colour()
 
     try:
 
         while True:
-            e = await tkio.pop_event()
+            e = await tkio.pop_event(canvas)
             et = str(e.type)
             if et in {"Motion", "Enter"}:
                 if x is None:
                     x, y = e.x, e.y
-                canvas.create_line(e.x, e.y, x, y, fill=colour, width=2)
+                canvas.create_line(e.x, e.y, x, y, fill=colour, width=3)
                 x, y = e.x, e.y
-                canvas.create_oval(x - 1, y - 1, x + 1, y + 1, outline=colour)
+                canvas.create_oval(x - 1, y - 1, x + 1, y + 1, outline=colour, fill=colour)
+            elif et == "Leave":
+                x = y = None
             elif et == "ButtonPress":
                 last = None
                 if e.num == 3:
@@ -56,4 +58,4 @@ async def test():
 
 
 if __name__ == "__main__":
-    tkio.run(test())
+    tkio.run(drawing_canvas())
