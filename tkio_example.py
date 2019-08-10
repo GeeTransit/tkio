@@ -64,4 +64,3 @@ if __name__ == "__main__":
     with tkio.TkLoop() as tkl:
         tkl.run(tkio.new_task(test(True)))
         tkl.run(test(False))
-        print("==closing==")

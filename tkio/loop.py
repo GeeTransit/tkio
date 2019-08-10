@@ -59,10 +59,7 @@ class TkLoop:
                     await task.cancel(blocking=False)
 
             while self._tasks:
-                print(self._tasks)
-                val, exc = self._runner.send(shutdown_coro())
-                if exc:
-                    print(repr(exc))
+                self._runner.send(shutdown_coro())
             self._runner.close()
             self._closed = True
 
@@ -70,7 +67,6 @@ class TkLoop:
             try:
                 val, exc = self._runner.send(coro)
             except BaseException as e:
-                print(f"loop stopped from {e!r}")
                 val, exc = None, e
                 self._runner.close()
                 self._closed = True
@@ -219,7 +215,7 @@ class TkLoop:
             def close_window():
                 for task in self._tasks.values():
                     if task.state != "INITIAL":
-                        cancel_task(task, CloseWindow("X was pressed"))
+                        cancel_task(task, exc=CloseWindow("X was pressed"))
                 safe_send(cycle, "CLOSE_WINDOW")
                 return "break"
 
