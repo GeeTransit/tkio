@@ -104,6 +104,17 @@ class TkLoop:
                 reschedule(task)
                 return task
 
+            def cancel_task(task, /, *, exc=TaskCancelled, val=None):
+                if cancel_func := task._cancel_func:
+                    cancel_func()
+                    task._cancel_func = None
+                task.state = "CANCELLED"
+                if isinstance(exc, BaseException):
+                    task._val = exc
+                else:
+                    task._val = exc(exc.__name__ if val is None else val)
+                reschedule(task)
+
             @contextlib.contextmanager
             def after_call():
                 if ready_tasks or sleep_wait:
@@ -174,15 +185,7 @@ class TkLoop:
                 current._val = current
 
             def _act_cancel_task(task, exc, val):
-                if cancel_func := task._cancel_func:
-                    cancel_func()
-                    task._cancel_func = None
-                task.state = "CANCELLED"
-                if isinstance(exc, BaseException):
-                    task._val = exc
-                else:
-                    task._val = exc(exc.__name__ if val is None else val)
-                reschedule(task)
+                cancel_task(task, exc=exc, val=val)
 
             def _act_wait_task(task):
                 suspend_current("TASK_WAIT", task.waiting.add(current))
@@ -216,7 +219,7 @@ class TkLoop:
             def close_window():
                 for task in self._tasks.values():
                     if task.state != "INITIAL":
-                        _act_cancel_task(task, CloseWindow("X was pressed"))
+                        cancel_task(task, CloseWindow("X was pressed"))
                 safe_send(cycle, "CLOSE_WINDOW")
                 return "break"
 
@@ -285,7 +288,10 @@ class TkLoop:
                         while running:
 
                             try:
-                                act = current.coro.send(current._val)
+                                if isinstance(current._val, BaseException):
+                                    act = current.coro.throw(current._val)
+                                else:
+                                    act = current.coro.send(current._val)
 
                             except BaseException as e:
                                 running = False
