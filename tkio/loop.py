@@ -163,7 +163,7 @@ class TkLoop:
                     elif sleep_wait:
                         timeout = (min(sleep_wait) - monotonic())*1000
                         data = "SLEEP_WAKE"
-                    with after(frame, timeout, lambda: send(cycle, data)):
+                    with after(frame, timeout, lambda: safe_send(cycle, data)):
                         yield
                 else:
                     yield
@@ -535,11 +535,18 @@ class TkLoop:
         def send(gen, data):
             try:
                 return gen.send(data)
+
             except BaseException as e:
                 nonlocal val, exc
+
+                # Tell tkinter to stop running the `wait_window` call
                 destroy(frame)
+
+                # The gen was already closed meaning the exception
+                # has been saved beforehand.
                 if isinstance(e, StopAsyncIteration):
                     pass
+
                 elif isinstance(e, StopIteration):
                     val, exc = e.value
                 else:
