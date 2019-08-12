@@ -1,6 +1,22 @@
+import contextlib
+
 from .acts import *
 from .exceptions import *
 from .holders import *
+
+
+__all__ = [
+    "Task",
+    "get_time",
+    "sleep",
+    "schedule",
+    "wait_event",
+    "pop_event",
+    "get_tk",
+    "new_task",
+    "this_task",
+    "block_cancellation",
+]
 
 
 class Task:
@@ -129,17 +145,12 @@ async def this_task():
     return await _this_task()
 
 
-class block_cancellation:
-    def __init__(self):
-        self.task = None
-        self.previous = None
-
-    async def __aenter__(self):
-        self.task = task = await _this_task()
-        self.previous = task.allow_cancel
-        task.allow_cancel = False
-
-    async def __aexit__(self, exc, val, tb):
-        self.task.allow_cancel = self.previous
-        self.task = None
-        self.previous = None
+@contextlib.asynccontextmanager
+async def block_cancellation():
+    task = await _this_task()
+    previous = task.allow_cancel
+    task.allow_cancel = False
+    try:
+        yield
+    finally:
+        task.allow_cancel = previous

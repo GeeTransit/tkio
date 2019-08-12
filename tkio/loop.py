@@ -13,6 +13,9 @@ from .holders import *
 from .task import *
 
 
+__all__ = ["TkLoop", "run"]
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -73,6 +76,8 @@ class TkLoop:
                 raise ValueError("Cannot supply `coro` and `shutdown` in same call")
 
             async def shutdown_coro():
+                this = await this_task()
+                this.daemon = True
                 for task in self._tasks.values():
                     await task.cancel(blocking=False)
 
@@ -101,35 +106,40 @@ class TkLoop:
 
     def _run_coro(self):
 
+
+        # --- Initial states ---
+
+        # Mapping of task id to task
+        self._tasks = tasks = {}
+
+        # Deque of tasks ready to be run
+        ready_tasks = collections.deque()
+
+        # Deque of waiting events
+        event_queue = collections.deque()
+
+        # Holders for event waiting and sleeping
+        event_wait = SetHolder()
+        sleep_wait = collections.defaultdict(SetHolder)
+
+        # Reduce lookup costs by rebinding them here
+        ready_tasks_append = ready_tasks.append
+        ready_tasks_popleft = ready_tasks.popleft
+
+        contextlib_contextmanager = contextlib.contextmanager
+        functools_wraps = functools.wraps
+        time_monotonic = time.monotonic
+        types_coroutine = types.coroutine
+
+
         # Internal loop (run via tkinter)
         async def _run_loop():
-
-
-            # --- Initial states ---
-
-            # Mapping of task id to task
-            self._tasks = tasks = {}
-
-            # Deque of tasks ready to be run
-            ready_tasks = collections.deque()
-
-            # Deque of waiting events
-            event_queue = collections.deque()
-
-            # Holders for event waiting and sleeping
-            event_wait = SetHolder()
-            sleep_wait = collections.defaultdict(SetHolder)
-
-            # Reduce lookup costs by rebinding them here
-            time_monotonic = time.monotonic
-            ready_tasks_append = ready_tasks.append
-            functools_wraps = functools.wraps
 
 
             # --- Helper functions ---
 
             # This is the only way to suspend and wait for a callback
-            @types.coroutine
+            @types_coroutine
             def _suspend():
                 return (yield)
 
@@ -180,7 +190,7 @@ class TkLoop:
                 reschedule(task)
 
             # Ensure a resumation of the cycle if required
-            @contextlib.contextmanager
+            @contextlib_contextmanager
             def after_call():
                 if ready_tasks or sleep_wait:
                     if ready_tasks:
@@ -267,7 +277,8 @@ class TkLoop:
 
             @blocking_act
             def _act_wait_task(task):
-                suspend_current("TASK_WAIT", task.waiting.add(current))
+                if not task.terminated:
+                    suspend_current("TASK_WAIT", task.waiting.add(current))
 
             def _act_get_tasks():
                 current._val = self._tasks
@@ -382,7 +393,7 @@ class TkLoop:
 
                     # Run all ready tasks
                     for _ in range(len(ready_tasks)):
-                        current = ready_tasks.popleft()
+                        current = ready_tasks_popleft()
                         current.state = "RUNNING"
                         running = True
 
@@ -461,7 +472,7 @@ class TkLoop:
         async def wrap_coro(coro):
             return await coro
 
-        @contextlib.contextmanager
+        @contextlib_contextmanager
         def destroying(*widgets):
             try:
                 if len(widgets) == 1:
@@ -472,16 +483,17 @@ class TkLoop:
                 for w in reversed(widgets):
                     destroy(w)
 
-        @contextlib.contextmanager
+        @contextlib_contextmanager
         def prepare_bindings(tk, tkfunc, otherfunc, destroyfunc, closefunc):
             with contextlib.ExitStack() as stack:
-                stack.enter_context(bind(tk, tkfunc, *self.tk_events))
-                stack.enter_context(bind(tk, otherfunc, *self.other_events))
-                stack.enter_context(bind(tk, destroyfunc, "<Destroy>"))
-                stack.enter_context(protocol(tk, closefunc))
+                stack_enter_context = stack.enter_context
+                stack_enter_context(bind(tk, tkfunc, *self.tk_events))
+                stack_enter_context(bind(tk, otherfunc, *self.other_events))
+                stack_enter_context(bind(tk, destroyfunc, "<Destroy>"))
+                stack_enter_context(protocol(tk, closefunc))
                 yield
 
-        @contextlib.contextmanager
+        @contextlib_contextmanager
         def bind(widget, func, *events):
             widget_bind = widget.bind
             widget_unbind = widget.unbind
@@ -498,7 +510,7 @@ class TkLoop:
                 except tkinter.TclError:
                     pass
 
-        @contextlib.contextmanager
+        @contextlib_contextmanager
         def after(widget, ms, func):
             id_ = widget.after(max(int(ms), 1), func)
             try:
@@ -509,7 +521,7 @@ class TkLoop:
                 except tkinter.TclError:
                     pass
 
-        @contextlib.contextmanager
+        @contextlib_contextmanager
         def prepare_loop():
             loop = _run_loop()
 
@@ -532,7 +544,7 @@ class TkLoop:
                 else:
                     raise RuntimeError("final cycle didn't stop at finalization")
 
-        @contextlib.contextmanager
+        @contextlib_contextmanager
         def protocol(toplevel, func):
             toplevel.protocol("WM_DELETE_WINDOW", func)
             try:
