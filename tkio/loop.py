@@ -1,44 +1,61 @@
 import collections
 import contextlib
+import functools
 import inspect
+import logging
 import operator
-import selectors
-import sys
+import time
 import tkinter
-import traceback
-
-from functools import wraps
-from time import monotonic
-from types import coroutine
+import types
 
 from .exceptions import *
 from .holders import *
 from .task import *
 
 
+logger = logging.getLogger(__name__)
+
 
 class TkLoop:
 
     tk_events = (
-        '<Activate>', '<Circulate>', '<Colormap>', '<Deactivate>',
-        '<FocusIn>', '<FocusOut>', '<Gravity>', '<Key>', '<KeyPress>',
-        '<KeyRelease>', '<MouseWheel>', '<Property>',
+        "<Activate>",
+        "<Circulate>",
+        "<Colormap>",
+        "<Deactivate>",
+        "<FocusIn>",
+        "<FocusOut>",
+        "<Gravity>",
+        "<Key>",
+        "<KeyPress>",
+        "<KeyRelease>",
+        "<MouseWheel>",
+        "<Property>",
     )
 
     other_events = (
-        '<Button>', '<ButtonPress>', '<ButtonRelease>', '<Configure>',
-        '<Enter>', '<Expose>', '<Leave>', '<Map>', '<Motion>',
-        '<Reparent>', '<Unmap>', '<Visibility>',
+        "<Button>",
+        "<ButtonPress>",
+        "<ButtonRelease>",
+        "<Configure>",
+        "<Enter>",
+        "<Expose>",
+        "<Leave>",
+        "<Map>",
+        "<Motion>",
+        "<Reparent>",
+        "<Unmap>",
+        "<Visibility>",
     )
 
-    def __init__(self, /):
+    def __init__(self):
 
         self._runner = None
         self._closed = False
         self._tasks = None
         self._actions = None
 
-    def run(self, coro=None, /, *, shutdown=False):
+    def run(self, coro=None, *, shutdown=False):
 
         if self._closed:
             if shutdown:
@@ -82,32 +99,58 @@ class TkLoop:
             raise exc
         return val
 
-    def _run_coro(self, /):
+    def _run_coro(self):
 
+        # Internal loop (run via tkinter)
         async def _run_loop():
 
-            @coroutine
-            def _suspend(data=None, /):
-                return (yield data)
 
-            def reschedule(task, /):
-                ready_tasks.append(task)
+            # --- Initial states ---
+
+            # Mapping of task id to task
+            self._tasks = tasks = {}
+
+            # Deque of tasks ready to be run
+            ready_tasks = collections.deque()
+
+            # Deque of waiting events
+            event_queue = collections.deque()
+
+            # Holders for event waiting and sleeping
+            event_wait = SetHolder()
+            sleep_wait = collections.defaultdict(SetHolder)
+
+            # Reduce lookup costs by rebinding them here
+            time_monotonic = time.monotonic
+            ready_tasks_append = ready_tasks.append
+            functools_wraps = functools.wraps
+
+
+            # --- Helper functions ---
+
+            # This is the only way to suspend and wait for a callback
+            @types.coroutine
+            def _suspend():
+                return (yield)
+
+            def reschedule(task):
+                ready_tasks_append(task)
                 task.state = "READY"
                 task.cancel_func = None
 
-            def suspend_current(state, cancel_func, /):
+            def suspend_current(state, cancel_func):
                 nonlocal running
                 current.state = state
                 current.cancel_func = cancel_func
                 running = False
 
-            def new_task(coro, /, *, eventless=False):
+            def new_task(coro, *, eventless=False):
                 task = Task(coro, eventless=eventless)
                 tasks[task.id] = task
                 reschedule(task)
                 return task
 
-            def cancel_task(task, /, *, exc=TaskCancelled, val=None):
+            def cancel_task(task, *, exc=TaskCancelled, val=None):
                 if task.cancelled:
                     return
 
@@ -136,23 +179,6 @@ class TkLoop:
                 task.cancel_pending = None
                 reschedule(task)
 
-            # Helper function to filter events
-            def check_event(event, widget):
-                # All toplevel events are accepted
-                if event.widget == tk:
-                    return True
-
-                # Accept any event
-                if widget is None:
-                    return True
-
-                # Accept if widget matches request
-                if event.widget == widget:
-                    return True
-
-                # Any other events can be ignored
-                return False
-
             # Ensure a resumation of the cycle if required
             @contextlib.contextmanager
             def after_call():
@@ -161,91 +187,71 @@ class TkLoop:
                         timeout = 0
                         data = "READY"
                     elif sleep_wait:
-                        timeout = (min(sleep_wait) - monotonic())*1000
+                        timeout = (min(sleep_wait) - time_monotonic()) * 1000
                         data = "SLEEP_WAKE"
                     with after(frame, timeout, lambda: safe_send(cycle, data)):
                         yield
                 else:
                     yield
 
-            # Decorator to check current task's `cancel_pending` before continuing
+
+            # --- Act decorators ---
+
+            # Check current task's `cancel_pending` before continuing
             def blocking_act(func):
-                @wraps(func)
+                @functools_wraps(func)
                 def _wrapper(*args):
                     if current.allow_cancel and current.cancel_pending:
                         current._val = current.cancel_pending
                         current.cancel_pending = None
                     else:
                         func(*args)
+
                 return _wrapper
 
-            # Decorator to restrict act to event tasks
+            # Restrict act to event tasks only
             def event_act(func):
-                @wraps(func)
+                @functools_wraps(func)
                 def _wrapper(*args):
                     if current._next_event == -1:
                         current._val = TaskEventless("Task is eventless")
                     else:
                         func(*args)
+
                 return _wrapper
 
-            # Decorator to return "break" for tkinter callbacks
-            def tkinter_callback(func):
-                @wraps(func)
-                def _wrapper(*args):
-                    func(*args)
-                    return "break"
-                return _wrapper
+
+            # --- Acts ---
 
             # Functions invoked by the current task
             # (These are the loop side of acts)
             def _act_get_time():
-                current._val = monotonic()
+                current._val = time_monotonic()
 
             @blocking_act
             def _act_sleep(tm):
                 if tm > 0:
-                    suspend_current("SLEEP", sleep_wait[monotonic() + tm].add(current))
+                    suspend_current("SLEEP", sleep_wait[time_monotonic() + tm].add(current))
                 else:
                     nonlocal running
                     running = False
-                    current._val = monotonic()
+                    current._val = time_monotonic()
                     reschedule(current)
+
+            @event_act
+            def _act_pop_event():
+                try:
+                    event = event_queue[current._next_event]
+                except IndexError:
+                    current._val = NoEvent("No event available")
+                else:
+                    current._next_event += 1
+                    current._val = event
 
             @blocking_act
             @event_act
             def _act_wait_event():
                 suspend_current("EVENT_WAIT", event_wait.add(current))
-
-            @event_act
-            def _act_pop_event(widget):
-                while True:
-                    try:
-                        event = event_queue[current._next_event]
-                    except IndexError:
-                        current._val = NoEvent("No event available")
-                        break
-                    else:
-                        current._next_event += 1
-                        if check_event(event, widget):
-                            current._val = event
-                            break
-
-            @event_act
-            def _act_get_events(widget):
-                start = current._next_event
-                end = len(event_queue)
-                current._next_event += len_event_queue
-                events = []
-                for i in range(start, end):
-                    event = event_queue[i]
-                    if check_event(event, widget):
-                        events.append(event)
-                current._val = events
-
-            @event_act
-            def _act_clear_events():
-                current._next_event += len(event_queue)
 
             def _act_get_tk():
                 current._val = tk
@@ -265,6 +271,25 @@ class TkLoop:
 
             def _act_get_tasks():
                 current._val = self._tasks
+
+            # Mapping of act name to function
+            self._actions = actions = {
+                name[5:]: value
+                for name, value in locals().items()
+                if name.startswith("_act_")
+            }
+
+
+            # --- Tkinter callbacks ---
+
+            # Decorator to return "break" for tkinter callbacks
+            def tkinter_callback(func):
+                @functools_wraps(func)
+                def _wrapper(*args):
+                    func(*args)
+                    return "break"
+
+                return _wrapper
 
             # Send if the cycle is suspended
             def safe_send(gen, data):
@@ -297,15 +322,8 @@ class TkLoop:
                     cancel_task(task, exc=CloseWindow("X was pressed"))
                 safe_send(cycle, "CLOSE_WINDOW")
 
-            # Mapping of act name to function
-            self._actions = actions = {
-                name[5:]: value
-                for name, value in locals().items()
-                if name.startswith("_act_")
-            }
 
-            # Mapping of task id to task
-            tasks = self._tasks = {}
+            # --- Main loop preparation ---
 
             # Result of task
             val = exc = None
@@ -313,26 +331,14 @@ class TkLoop:
             # Main task
             main_task = None
 
-            # Deque of tasks ready to be run
-            ready_tasks = collections.deque()
-
-            # Deque of waiting events
-            event_queue = collections.deque()
-
-            # Holders for event waiting and sleeping
-            event_wait = SetHolder()
-            sleep_wait = collections.defaultdict(SetHolder)
-
-
-
             # Wrapping events callbacks with an unbind
             with prepare_bindings(
-                tk,
-                send_tk_event, send_other_event,
-                send_destroy_event, close_window,
+                tk, send_tk_event, send_other_event, send_destroy_event, close_window
             ):
 
-                # Main loop
+
+                # --- Main loop ---
+
                 while True:
 
                     # Yield if just started or main task just terminated
@@ -354,16 +360,18 @@ class TkLoop:
                         for task in event_wait.popall():
                             reschedule(task)
 
-                    # check for amount of events that have been consumed by all tasks
-                    if event_tasks := [task for task in tasks.values() if task._next_event != -1]:
-                        if leftover := min(task._next_event for task in event_tasks):
+                    # check for amount of events that have been consumed by all event tasks
+                    event_tasks = [task for task in tasks.values() if task._next_event != -1]
+                    if event_tasks:
+                        leftover = min(task._next_event for task in event_tasks)
+                        if leftover:
                             for _ in range(leftover):
                                 event_queue.popleft()
                             for task in event_tasks:
                                 task._next_event -= leftover
 
                     # Waking sleeping tasks here
-                    now = monotonic()
+                    now = time_monotonic()
                     for tm in list(sleep_wait.keys()):
                         if tm <= now:
                             for task in sleep_wait.pop(tm).popall():
@@ -383,9 +391,9 @@ class TkLoop:
 
                             # Send the act result
                             try:
-                                # Note: The `_act` generator will raise the result
-                                # if it is an exception. No need for chucking
-                                # exceptions deep into the stack.
+                                # Note: The `_act` generator will raise the
+                                # result if it is an exception. No need for
+                                # chucking exceptions deep into the stack.
                                 act = current.coro.send(current._val)
 
                             # Task terminated
@@ -402,9 +410,12 @@ class TkLoop:
                                     current.result = e.value
                                 else:
                                     current.exception = e
-                                    if current.report_crash and not isinstance(e, (TaskCancelled, SystemExit)):
-                                        print(f"Task crash: {current}", file=sys.stderr)
-                                        traceback.print_exc()
+                                    if current.report_crash and not isinstance(
+                                        e, (TaskCancelled, SystemExit)
+                                    ):
+                                        logger.error(
+                                            "Task crash: %r", current, exc_info=True
+                                        )
                                     # Re-raise the exception to end the loop immediately
                                     if not isinstance(e, Exception):
                                         raise
@@ -464,14 +475,14 @@ class TkLoop:
         @contextlib.contextmanager
         def prepare_bindings(tk, tkfunc, otherfunc, destroyfunc, closefunc):
             with contextlib.ExitStack() as stack:
-                stack.enter_context(binding(tk, tkfunc, *self.tk_events))
-                stack.enter_context(binding(tk, otherfunc, *self.other_events))
-                stack.enter_context(binding(tk, destroyfunc, "<Destroy>"))
+                stack.enter_context(bind(tk, tkfunc, *self.tk_events))
+                stack.enter_context(bind(tk, otherfunc, *self.other_events))
+                stack.enter_context(bind(tk, destroyfunc, "<Destroy>"))
                 stack.enter_context(protocol(tk, closefunc))
                 yield
 
         @contextlib.contextmanager
-        def binding(widget, func, *events):
+        def bind(widget, func, *events):
             widget_bind = widget.bind
             widget_unbind = widget.unbind
             bindings = [(event, widget_bind(event, func)) for event in events]
@@ -559,8 +570,8 @@ class TkLoop:
         with destroying(tkinter.Tk()) as tk:
             with prepare_loop() as loop:
 
-                # Make sure toplevel and loop still exist
-                while exists(tk) and getasyncgenstate(loop) != "AGEN_CLOSED":
+                # Outside loop
+                while True:
 
                     # Get coro to run
                     coro = yield val, exc
@@ -576,12 +587,20 @@ class TkLoop:
                         send(cycle, None)
                         wait_window(frame)
 
-                    # Check if cycle is still running
+                    # Check if cycle has closed
                     if inspect.getcoroutinestate(cycle) != "CORO_CLOSED":
                         cycle.close()
-                        raise RuntimeError("frame closed before main coro finished") from exc
+                        raise RuntimeError(
+                            "frame closed before main coro finished"
+                        ) from exc
 
-        return val, exc
+                    # Check if toplevel exists
+                    if not exists(tk):
+                        raise RuntimeError("Toplevel was destroyed") from exc
+
+                    # Check if loop is still running
+                    if getasyncgenstate(loop) == "AGEN_CLOSED":
+                        raise RuntimeError("Loop was closed") from exc
 
     def __enter__(self):
         return self
@@ -591,8 +610,9 @@ class TkLoop:
 
     def __del__(self):
         if not self._closed:
-            raise RuntimeError("IWindow wasn't shutdown with IWindow.run(shutdown=True)")
-
+            raise RuntimeError(
+                "IWindow wasn't shutdown with IWindow.run(shutdown=True)"
+            )
 
 
 def run(coro):

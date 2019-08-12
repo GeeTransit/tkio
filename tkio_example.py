@@ -26,7 +26,7 @@ async def drawing_canvas():
     try:
 
         while True:
-            e = await tkio.pop_event(canvas)
+            e = await tkio.pop_event()
             et = str(e.type)
             if et in {"Motion", "Enter"}:
                 if x is None:
