@@ -26,7 +26,7 @@ async def drawing_canvas():
     try:
 
         while True:
-            e = await tkio.pop_event(canvas)
+            e = await tkio.pop_event()
             et = str(e.type)
             if et in {"Motion", "Enter"}:
                 if x is None:
@@ -53,10 +53,9 @@ async def drawing_canvas():
                 last = None
 
     except tkio.CloseWindow:
-        raise
         pass
 
 
 
-# if __name__ == "__main__":
-#     tkio.run(drawing_canvas())
+if __name__ == "__main__":
+    tkio.run(drawing_canvas())

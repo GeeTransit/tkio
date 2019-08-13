@@ -68,7 +68,7 @@ class Task:
     async def cancel(self, *, exc=TaskCancelled, blocking=True):
         if self.cancelled:
             return False
-        await _cancel_task(self, exc)
+        await _cancel_task(self, exc=exc)
         if blocking:
             await self.wait()
         self.joined = True
