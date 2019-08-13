@@ -1,7 +1,7 @@
 import itertools
 import tkinter
 
-# import tkio
+import tkio
 
 
 
@@ -273,10 +273,8 @@ async def program(
             et = str(event.type)
 
             if et == "KeyPress":
-                if event.keysym == "p":
-                    print(grid)
 
-                elif event.keysym == "h":
+                if event.keysym == "h":
                     hints = not hints
 
                 elif event.keysym == "Return":
