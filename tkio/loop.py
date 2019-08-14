@@ -118,9 +118,9 @@ class TkLoop:
         # Deque of waiting events
         event_queue = collections.deque()
 
-        # Holders for event waiting and sleeping
+        # Holders for event waiting, sleeping, and timeouts
         event_wait = SetHolder()
-        sleep_wait = collections.defaultdict(SetHolder)
+        time_wait = collections.defaultdict(SetHolder)
 
         # Current task
         current = None
@@ -143,10 +143,11 @@ class TkLoop:
 
         # --- Acts helper functions ---
 
-        def reschedule(task):
+        def reschedule(task, val=None):
             ready_tasks_append(task)
             task.state = "READY"
             task.cancel_func = None
+            task._val = val
 
         def suspend_current(state, cancel_func):
             nonlocal running
@@ -161,10 +162,6 @@ class TkLoop:
             return task
 
         def cancel_task(task, *, exc=TaskCancelled, val=None):
-            if task.cancelled:
-                return
-
-            task.cancelled = True
 
             # Create the exception instance
             if isinstance(exc, BaseException):
@@ -185,9 +182,28 @@ class TkLoop:
 
             # Prepare task with exception
             task.cancel_func()
-            task._val = task.cancel_pending
+            reschedule(task, task.cancel_pending)
             task.cancel_pending = None
-            reschedule(task)
+
+        def set_timeout(tm, ty):
+
+            # Save current task for a reset later
+            task = current
+
+            time_remove = time_wait[tm].add((task, ty))
+
+            previous = getattr(task, ty)
+
+            # Update task state if `tm` is now the earliest one
+            if previous is None or tm <= previous:
+                setattr(task, ty, tm)
+
+            def _remove_func():
+                setattr(task, ty, previous)
+                time_remove()
+                return previous
+
+            return _remove_func
 
 
         # --- Act decorators ---
@@ -197,10 +213,11 @@ class TkLoop:
             @functools_wraps(func)
             def _wrapper(*args):
                 if current.allow_cancel and current.cancel_pending:
-                    current._val = current.cancel_pending
+                    exc = current.cancel_pending
                     current.cancel_pending = None
+                    return exc
                 else:
-                    func(*args)
+                    return func(*args)
 
             return _wrapper
 
@@ -209,9 +226,9 @@ class TkLoop:
             @functools_wraps(func)
             def _wrapper(*args):
                 if current._next_event == -1:
-                    current._val = TaskEventless("Task is eventless")
+                    return TaskEventless("Task is eventless")
                 else:
-                    func(*args)
+                    return func(*args)
 
             return _wrapper
 
@@ -221,27 +238,26 @@ class TkLoop:
         # Functions invoked by the current task
         # (These are the loop side of acts)
         def _act_get_time():
-            current._val = time_monotonic()
+            return time_monotonic()
 
         @blocking_act
         def _act_sleep(tm):
             if tm > 0:
-                suspend_current("SLEEP", sleep_wait[time_monotonic() + tm].add(current))
+                suspend_current("SLEEP", set_timeout(time_monotonic() + tm, "sleep"))
             else:
                 nonlocal running
                 running = False
-                current._val = time_monotonic()
-                reschedule(current)
+                reschedule(current, time_monotonic())
 
         @event_act
         def _act_pop_event():
             try:
                 event = event_queue[current._next_event]
             except IndexError:
-                current._val = NoEvent("No event available")
+                return NoEvent("No event available")
             else:
                 current._next_event += 1
-                current._val = event
+                return event
 
         @blocking_act
         @event_act
@@ -249,24 +265,40 @@ class TkLoop:
             suspend_current("EVENT_WAIT", event_wait.add(current))
 
         def _act_get_tk():
-            current._val = tk
+            return tk
 
         def _act_new_task(coro, eventless):
-            current._val = new_task(coro, eventless=eventless)
+            return new_task(coro, eventless=eventless)
 
         def _act_this_task():
-            current._val = current
+            return current
 
         def _act_cancel_task(task, exc, val):
-            cancel_task(task, exc=exc, val=val)
+            # Only cancel if not already cancelled
+            if not task.cancelled:
+                task.cancelled = True
+                cancel_task(task, exc=exc, val=val)
 
         @blocking_act
         def _act_wait_task(task):
-            if not task.terminated:
-                suspend_current("TASK_WAIT", task.waiting.add(current))
+            suspend_current("TASK_WAIT", task.waiting.add(current))
 
         def _act_get_tasks():
-            current._val = tasks
+            return tasks
+
+        def _act_add_timeout(tm):
+            return set_timeout(time_monotonic() + tm, "timeout")
+
+        def _act_remove_timeout(remove_func):
+            now = time_monotonic()
+            last = remove_func()
+            # Check if there is another timeout
+            if last and last >= now:
+                # Remove the pending exception if it is a timeout
+                # as it is most likely the timeout after this
+                if isinstance(current.cancel_pending, TaskTimeout):
+                    current.cancel_pending = None
+            return now
 
         # Mapping of act name to function
         self._actions = actions = {
@@ -356,12 +388,12 @@ class TkLoop:
         # Ensure a resumation of the cycle if required
         @contextlib_contextmanager
         def after_call():
-            if ready_tasks or sleep_wait:
+            if ready_tasks or time_wait:
                 if ready_tasks:
                     timeout = 0
                     data = "READY"
-                elif sleep_wait:
-                    timeout = (min(sleep_wait) - time_monotonic()) * 1000
+                elif time_wait:
+                    timeout = (min(time_wait) - time_monotonic()) * 1000
                     data = "SLEEP_WAKE"
 
                 id_ = frame.after(max(int(timeout), 1), lambda: safe_send(cycle, data))
@@ -521,13 +553,25 @@ class TkLoop:
                         for task in event_tasks:
                             task._next_event -= leftover
 
-                # Waking sleeping tasks here
+                # Wake sleeps and timeouts here
                 now = time_monotonic()
-                for tm in list(sleep_wait.keys()):
-                    if tm <= now:
-                        for task in sleep_wait.pop(tm).popall():
-                            task._val = now
-                            reschedule(task)
+                for tm in list(time_wait.keys()):
+
+                    # Only check for ones that have expired
+                    if tm > now:
+                        continue
+
+                    for task, ty in time_wait.pop(tm).popall():
+
+                        # Check if the times match
+                        if getattr(task, ty) != tm:
+                            continue
+
+                        setattr(task, ty, None)
+                        if ty == "sleep":
+                            reschedule(task, now)
+                        else:
+                            cancel_task(task, exc=TaskTimeout(f"Task timed out at {now}"))
 
                 # Add socket / selectors stuff here
 
@@ -575,12 +619,11 @@ class TkLoop:
 
                         # Act received: time to run it
                         else:
-                            current._val = None
 
                             # If this raises an exception, let it propagate
                             # as this is most likely a programming error on
                             # the loop, not the task.
-                            actions[act[0]](*act[1:])
+                            current._val = actions[act[0]](*act[1:])
 
 
         # --- Outer loop preparation ---

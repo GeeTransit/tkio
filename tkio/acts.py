@@ -14,16 +14,19 @@ __all__ = [
     "_cancel_task",
     "_wait_task",
     "_get_tasks",
+    "_add_timeout",
+    "_remove_timeout",
 ]
 
 
 # This basic generator is the only way into the loop
 @coroutine
-def _act(*data):
-    result = (yield data)
-    if isinstance(result, BaseException):
-        raise result
-    return result
+def _act(*act):
+    val = (yield act)
+    if isinstance(val, BaseException):
+        raise val
+    else:
+        return val
 
 
 # --- Specialized acts ---
@@ -51,7 +54,7 @@ async def _pop_event():
 
 # Blocking
 async def _wait_event():
-    await _act("wait_event")
+    return await _act("wait_event")
 
 
 # Synchronous
@@ -71,14 +74,24 @@ async def _this_task():
 
 # Synchronous
 async def _cancel_task(task, *, exc=TaskCancelled, val=None):
-    await _act("cancel_task", task, exc, val)
+    return await _act("cancel_task", task, exc, val)
 
 
 # Blocking
 async def _wait_task(task):
-    await _act("wait_task", task)
+    return await _act("wait_task", task)
 
 
 # Synchronous
 async def _get_tasks():
     return await _act("get_tasks")
+
+
+# Synchronous
+async def _add_timeout(tm):
+    return await _act("add_timeout", tm)
+
+
+# Synchronous
+async def _remove_timeout(previous):
+    return await _act("remove_timeout", previous)
