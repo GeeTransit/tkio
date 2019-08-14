@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 class TkLoop:
 
-    tk_events = (
+    _tk_events = (
         "<Activate>",
         "<Circulate>",
         "<Colormap>",
@@ -36,7 +36,7 @@ class TkLoop:
         "<Property>",
     )
 
-    other_events = (
+    _other_events = (
         "<Button>",
         "<ButtonPress>",
         "<ButtonRelease>",
@@ -352,6 +352,8 @@ class TkLoop:
 
                 # The gen was already closed meaning the exception
                 # has been saved beforehand.
+                # Note: The cycle doesn't have a `return`, meaning
+                # the only way to exit is using an exception.
                 if isinstance(e, StopAsyncIteration):
                     pass
 
@@ -467,9 +469,8 @@ class TkLoop:
         def prepare_loop():
             loop = _run_loop()
 
-            cycle = loop.asend(None)
             try:
-                cycle.send(None)
+                loop.asend(None).send(None)
             except StopIteration:
                 pass
             else:
@@ -478,10 +479,9 @@ class TkLoop:
             try:
                 yield loop
             finally:
-                cycle = loop.aclose()
                 try:
-                    cycle.send(None)
-                except StopIteration:
+                    loop.aclose().send(None)
+                except StopAsyncIteration:
                     pass
                 else:
                     raise RuntimeError("final cycle didn't stop at finalization")
