@@ -10,6 +10,7 @@ __all__ = [
     "Task",
     "get_time",
     "sleep",
+    "wake_at",
     "schedule",
     "wait_event",
     "pop_event",
@@ -17,7 +18,10 @@ __all__ = [
     "new_task",
     "this_task",
     "block_cancellation",
-    "timeout",
+    "timeout_after",
+    "timeout_at",
+    "ignore_after",
+    "ignore_at",
 ]
 
 
@@ -51,10 +55,7 @@ class Task:
         self.cancel_pending = None  # Exception raised on next blocking call
         self.allow_cancel = True    # Task can be cancelled
         self.joined = False         # Task termination wasn't ignored
-
-        # Index of next event that will be returned next
-        # Note: -1 to signify that task doesn't want events
-        self._next_event = 0
+        self.next_event = 0         # Index of next event that will be returned next
 
         # Task result / exception
         self._result_val = None
@@ -117,6 +118,7 @@ class Task:
         else:
             return self._result_val
 
+
     @result.setter
     def result(self, val):
         self._result_val = val
@@ -129,6 +131,7 @@ class Task:
             raise RuntimeError("Task still running")
         return self._result_exc
 
+
     @exception.setter
     def exception(self, exc):
         self._result_val = None
@@ -140,11 +143,15 @@ async def get_time():
 
 
 async def sleep(tm):
-    return await _sleep(tm)
+    return await _sleep(tm, False)
+
+
+async def wake_at(tm):
+    return await _sleep(tm, True)
 
 
 async def schedule():
-    await _sleep(0)
+    await sleep(0)
 
 
 async def wait_event():
@@ -174,7 +181,7 @@ async def new_task(
     report_crash=True,
 ):
     task = await _new_task(coro)
-    task.eventless = -1 if eventless else 0
+    task.next_event = -1 if eventless else 0
     task.allow_cancel = allow_cancel
     task.daemon = daemon
     task.report_crash = report_crash
@@ -185,58 +192,130 @@ async def this_task():
     return await _this_task()
 
 
-@contextlib.asynccontextmanager
-async def block_cancellation():
-    task = await _this_task()
-    previous = task.allow_cancel
-    task.allow_cancel = False
-    try:
-        yield
-    finally:
-        task.allow_cancel = previous
+class _CancellationHelper:
 
-@contextlib.asynccontextmanager
-async def timeout(tm):
-    previous = await _add_timeout(tm)
-    tm += await _get_time()
+    async def __aenter__(self):
+        self.task = await this_task()
+        self._previous = self.task.allow_cancel
+        self.task.allow_cancel = False
+        return self
 
-    task = await _this_task()
-    deadlines = task._deadlines
-    deadlines.append(tm)
 
-    try:
-        yield
-
-    except (TaskTimeout, TimeoutCancellation) as e:
- 
-        now = await _remove_timeout(previous)
-
-        # Check who caused this timeout
-        for n, deadline in enumerate(deadlines):
-            if deadline <= now:
-                break
-
-        # No one raised this timeout? Raise a RuntimeError.
+    async def __aexit__(self, ty, val, tb):
+        self.task.allow_cancel = self._previous
+        if isinstance(val, CancelledError) and not self.task.allow_cancel:
+            self.task.cancel_pending = val
+            return True
         else:
-            raise RuntimeError("Unexpected timeout caught")
+            return False
 
-        # Some other outer timeout timed us out ._.
-        if n != len(deadlines) - 1:
-            if isinstance(e, TaskTimeout):
-                raise TimeoutCancellation(*e.args) from e
 
-        # We are the cause of this timeout
-        else:
-            if isinstance(e, TimeoutCancellation):
-                raise TaskTimeout(*e.args) from e
-
-        # Otherwise, just let the exception propagate
-        raise
-
+def block_cancellation(coro=None):
+    if coro is None:
+        return _CancellationHelper()
     else:
-        now = await _remove_timeout(previous)
-        if now > tm:
-            logger.warning("%r: Operation took longer than an enclosing timeout.", task)
+        async def _run():
+            async with _CancellationHelper():
+                return await coro
+        return _run()
 
-    finally:
-        deadlines.pop()
+
+class _TimeoutHelper:
+
+
+    def __init__(self, tm, *, absolute, ignore=False, result=None):
+        self._tm = tm
+        self._absolute = absolute
+        self._ignore = ignore
+        self._result = result
+        self.expired = False
+        self.result = None
+
+
+    async def __aenter__(self):
+        task = await this_task()
+
+        if not self._absolute:
+            self._tm += await get_time()
+            self._absolute = True
+
+        self._deadlines = task._deadlines
+        self._deadlines.append(self._tm)
+        self._previous = await _add_timeout(self._tm)
+        return self
+
+
+    async def __aexit__(self, ty, val, tb):
+        now = await _remove_timeout(self._previous)
+
+        try:
+            if ty in (TaskTimeout, TimeoutCancellation):
+                # Check who caused this timeout
+                for n, deadline in enumerate(self._deadlines):
+                    if deadline <= now:
+                        break
+
+                # No one raised this timeout? Raise a RuntimeError.
+                else:
+                    raise RuntimeError("Unexpected timeout")
+
+                # Some other outer timeout timed us out ._.
+                if n != len(self._deadlines) - 1:
+                    if ty is TaskTimeout:
+                        raise TimeoutCancellation(*val.args).with_traceback(tb) from None
+                    else:
+                        return False
+
+                # We are the cause of this timeout
+                else:
+                    self.result = self._result
+                    self.expired = True
+                    if self._ignore:
+                        return True
+                    elif ty is TimeoutCancellation:
+                        raise TaskTimeout(*val.args).with_traceback(tb) from None
+                    else:
+                        return False
+
+            else:
+                if now > self._deadlines[-1]:
+                    logger.warning(
+                        "%r: Operation took longer than an enclosing timeout.",
+                        await this_task(),
+                    )
+
+        finally:
+            self._deadlines.pop()
+
+
+async def _timeout_func(tm, coro, **kwargs):
+    async with _TimeoutHelper(tm, **kwargs):
+        return await coro
+
+    
+def timeout_after(tm, coro=None):
+    if coro is None:
+        return _TimeoutHelper(tm, absolute=False)
+    else:
+        return _timeout_func(tm, coro, absolute=False)
+
+
+def timeout_at(tm, coro=None):
+    if coro is None:
+        return _TimeoutHelper(tm, absolute=True)
+    else:
+        return _timeout_func(tm, coro, absolute=True)
+
+
+def ignore_after(tm, coro=None, *, result=None):
+    if coro is None:
+        return _TimeoutHelper(tm, absolute=False, ignore=True, result=result)
+    else:
+        return _timeout_func(tm, coro, absolute=False, ignore=True, result=result)
+
+
+def ignore_at(tm, coro=None, *, result=None):
+    if coro is None:
+        return _TimeoutHelper(tm, absolute=True, ignore=True, result=result)
+    else:
+        return _timeout_func(tm, coro, absolute=True, ignore=True, result=result)

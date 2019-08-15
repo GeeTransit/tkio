@@ -13,6 +13,11 @@ class NoEvent(TkioError):
     pass
 
 
+# When a loop has an error (to differentiate between task errors)
+class TkLoopError(TkioError):
+    pass
+
+
 # When an eventless task tries to access events
 class TaskEventless(TkioError):
     pass

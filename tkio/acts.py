@@ -44,8 +44,8 @@ async def _get_time():
 
 
 # Blocking
-async def _sleep(tm):
-    return await _act("_act_sleep", tm)
+async def _sleep(tm, absolute):
+    return await _act("_act_sleep", tm, absolute)
 
 
 # Synchronous

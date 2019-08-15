@@ -99,7 +99,7 @@ class TkLoop:
             except BaseException as e:
                 self._runner.close()
                 self._closed = True
-                raise RuntimeError("Loop failed to initialize") from e
+                raise TkLoopError("Loop failed to initialize") from e
 
         if shutdown:
             if coro:
@@ -125,7 +125,7 @@ class TkLoop:
             except BaseException as e:
                 self._runner.close()
                 self._closed = True
-                raise RuntimeError("Loop exited with error") from e
+                raise TkLoopError("Loop exited with error") from e
 
             else:
                 if exc:
@@ -211,7 +211,7 @@ class TkLoop:
             reschedule(task, task.cancel_pending)
             task.cancel_pending = None
 
-        def set_timeout(tm, ty):
+        def add_timeout(tm, ty):
 
             # Save current task for a reset later
             task = current
@@ -252,7 +252,7 @@ class TkLoop:
         def event_act(func):
             @functools_wraps(func)
             def _wrapper(*args):
-                if current._next_event == -1:
+                if current.next_event == -1:
                     return TaskEventless("Task is eventless")
                 else:
                     return func(*args)
@@ -268,22 +268,25 @@ class TkLoop:
             return time_monotonic()
 
         @blocking_act
-        def _act_sleep(tm):
-            if tm > 0:
-                suspend_current("SLEEP", set_timeout(time_monotonic() + tm, "sleep"))
-            else:
+        def _act_sleep(tm, absolute):
+            # A time of 0 means to let other tasks run
+            if tm == 0:
                 nonlocal running
                 running = False
                 reschedule(current, time_monotonic())
+            else:
+                if not absolute:
+                    tm += time_monotonic()
+                suspend_current("SLEEP", add_timeout(tm, "sleep"))
 
         @event_act
         def _act_pop_event():
             try:
-                event = event_queue[current._next_event]
+                event = event_queue[current.next_event]
             except IndexError:
                 return NoEvent("No event available")
             else:
-                current._next_event += 1
+                current.next_event += 1
                 return event
 
         @blocking_act
@@ -310,7 +313,7 @@ class TkLoop:
             return self
 
         def _act_add_timeout(tm):
-            return set_timeout(time_monotonic() + tm, "timeout")
+            return add_timeout(tm, "timeout")
 
         def _act_remove_timeout(remove_func):
             now = time_monotonic()
@@ -462,19 +465,22 @@ class TkLoop:
         def send_tk_event(event):
             if event.widget is tk:
                 event_queue_append(event)
-                safe_send(cycle, "EVENT_WAKE")
+                if event_wait:
+                    safe_send(cycle, "EVENT_WAKE")
 
         @tkinter_callback
         def send_other_event(event):
             if event.widget is not tk:
                 event_queue_append(event)
-                safe_send(cycle, "EVENT_WAKE")
+                if event_wait:
+                    safe_send(cycle, "EVENT_WAKE")
 
         @tkinter_callback
         def send_destroy_event(event):
             if event.widget is tk:
                 event_queue_append(event)
-                frame.after(1, lambda: safe_send(cycle, "EVENT_WAKE"))
+                if event_wait:
+                    frame.after(1, lambda: safe_send(cycle, "EVENT_WAKE"))
 
         @tkinter_callback
         def close_window():
@@ -575,14 +581,14 @@ class TkLoop:
                         reschedule(task)
 
                 # check for amount of events that have been consumed by all event tasks
-                event_tasks = [task for task in tasks.values() if task._next_event != -1]
+                event_tasks = [task for task in tasks.values() if task.next_event != -1]
                 if event_tasks:
-                    leftover = min(task._next_event for task in event_tasks)
+                    leftover = min(task.next_event for task in event_tasks)
                     if leftover:
                         for _ in range(leftover):
                             event_queue.popleft()
                         for task in event_tasks:
-                            task._next_event -= leftover
+                            task.next_event -= leftover
 
                 # Wake sleeps and timeouts here
                 now = time_monotonic()
