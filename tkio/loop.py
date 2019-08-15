@@ -51,76 +51,92 @@ class TkLoop:
         "<Visibility>",
     )
 
+
     def __init__(self):
 
+        # Loop runner state
         self._runner = None
         self._closed = False
-        self._tasks = None
-        self._actions = None
+
+        # Task and act dicts
+        self._tasks = {}
+        self._acts = {}
+
+        # Ready tasks to be run
+        self._ready_tasks = collections.deque()
+
+        # Events received by tkinter (and not all consumed)
+        self._event_queue = collections.deque()
+
+        # Holders for event and time based waiting
+        self._event_wait = SetHolder()
+        self._time_wait = collections.defaultdict(SetHolder)
+
+
+    def __enter__(self):
+        return self
+
+
+    def __exit__(self, exc, val, tb):
+        if not self._closed:
+            self.run(shutdown=True)
+
+
+    def __del__(self):
+        if not self._closed:
+            raise RuntimeError("TkLoop wasn't shutdown with TkLoop.run(shutdown=True)")
+
 
     def run(self, coro=None, *, shutdown=False):
 
         if self._closed:
-            if shutdown:
-                return
             raise RuntimeError("loop already shut down")
 
         if not self._runner:
             self._runner = self._run_coro()
-            self._runner.send(None)
-
-        val = exc = None
+            try:
+                self._runner.send(None)
+            except BaseException as e:
+                self._runner.close()
+                self._closed = True
+                raise RuntimeError("Loop failed to initialize") from e
 
         if shutdown:
             if coro:
                 raise ValueError("Cannot supply `coro` and `shutdown` in same call")
 
-            async def shutdown_coro():
-                this = await this_task()
-                this.daemon = True
-                for task in self._tasks.values():
+            async def shutdown_coro(tasks):
+                for task in tasks:
                     await task.cancel(blocking=False)
 
-            while self._tasks:
-                try:
-                    self._runner.send(shutdown_coro())
-                except BaseException:
-                    break
+            try:
+                while self._tasks:
+                    self._runner.send(shutdown_coro(self._tasks.values()))
+            except BaseException:
+                pass
+
             self._runner.close()
             self._closed = True
 
         else:
             try:
                 val, exc = self._runner.send(coro)
+
             except BaseException as e:
-                if isinstance(e, StopIteration):
-                    val, exc = e.value
-                else:
-                    val, exc = None, e
                 self._runner.close()
                 self._closed = True
+                raise RuntimeError("Loop exited with error") from e
 
-        if exc:
-            raise exc
-        return val
+            else:
+                if exc:
+                    raise exc
+                return val
+
 
     def _run_coro(self):
 
 
-        # --- Initial states ---
-
-        # Mapping of task id to task
-        self._tasks = tasks = {}
-
-        # Deque of tasks ready to be run
-        ready_tasks = collections.deque()
-
-        # Deque of waiting events
-        event_queue = collections.deque()
-
-        # Holders for event waiting, sleeping, and timeouts
-        event_wait = SetHolder()
-        time_wait = collections.defaultdict(SetHolder)
+        # --- Loop states ---
 
         # Current task
         current = None
@@ -128,7 +144,17 @@ class TkLoop:
         # Flag for if the current task is running
         running = True
 
-        # Reduce lookup costs by rebinding them here
+        # Rebindings from loop
+        tasks = self._tasks                 # Mapping of task id to task
+        acts = self._acts                   # Mapping of trap name to function
+        ready_tasks = self._ready_tasks     # Deque of tasks ready to be run
+        event_queue = self._event_queue     # Deque of waiting events
+        event_wait = self._event_wait       # Holder for event waiting
+        time_wait = self._time_wait         # Holder for time based waiting
+
+
+        # --- Bound methods ---
+
         ready_tasks_append = ready_tasks.append
         ready_tasks_popleft = ready_tasks.popleft
 
@@ -155,8 +181,8 @@ class TkLoop:
             current.cancel_func = cancel_func
             running = False
 
-        def new_task(coro, *, eventless=False):
-            task = Task(coro, eventless=eventless)
+        def new_task(coro):
+            task = Task(coro)
             tasks[task.id] = task
             reschedule(task)
             return task
@@ -198,6 +224,7 @@ class TkLoop:
             if previous is None or tm <= previous:
                 setattr(task, ty, tm)
 
+            # Function that removes time and returns the previous state
             def _remove_func():
                 setattr(task, ty, previous)
                 time_remove()
@@ -267,8 +294,8 @@ class TkLoop:
         def _act_get_tk():
             return tk
 
-        def _act_new_task(coro, eventless):
-            return new_task(coro, eventless=eventless)
+        def _act_new_task(coro):
+            return new_task(coro)
 
         def _act_this_task():
             return current
@@ -279,12 +306,8 @@ class TkLoop:
                 task.cancelled = True
                 cancel_task(task, exc=exc, val=val)
 
-        @blocking_act
-        def _act_wait_task(task):
-            suspend_current("TASK_WAIT", task.waiting.add(current))
-
-        def _act_get_tasks():
-            return tasks
+        def _act_get_loop():
+            return self
 
         def _act_add_timeout(tm):
             return set_timeout(time_monotonic() + tm, "timeout")
@@ -300,9 +323,17 @@ class TkLoop:
                     current.cancel_pending = None
             return now
 
+        @blocking_act
+        def _act_wait_holder(holder, state):
+            suspend_current(state, holder.add(current))
+
+        def _act_wake_holder(holder, n):
+            for _ in range(n):
+                reschedule(holder.pop())
+
         # Mapping of act name to function
-        self._actions = actions = {
-            name[5:]: value
+        acts = self._acts = {
+            name: value
             for name, value in locals().items()
             if name.startswith("_act_")
         }
@@ -481,7 +512,7 @@ class TkLoop:
             finally:
                 try:
                     loop.aclose().send(None)
-                except StopAsyncIteration:
+                except StopIteration as e:
                     pass
                 else:
                     raise RuntimeError("final cycle didn't stop at finalization")
@@ -490,8 +521,8 @@ class TkLoop:
         def prepare_tk():
             with contextlib.ExitStack() as stack:
                 stack_enter_context = stack.enter_context
-                stack_enter_context(bind(tk, send_tk_event, self.tk_events))
-                stack_enter_context(bind(tk, send_other_event, self.other_events))
+                stack_enter_context(bind(tk, send_tk_event, self._tk_events))
+                stack_enter_context(bind(tk, send_other_event, self._other_events))
                 stack_enter_context(bind(tk, send_destroy_event, ("<Destroy>",)))
                 stack_enter_context(protocol(tk, close_window))
                 yield
@@ -589,7 +620,7 @@ class TkLoop:
                             # Note: The `_act` generator will raise the
                             # result if it is an exception. No need for
                             # chucking exceptions deep into the stack.
-                            act = current.coro.send(current._val)
+                            act = current._send(current._val)
 
                         # Task terminated
                         except BaseException as e:
@@ -623,7 +654,7 @@ class TkLoop:
                             # If this raises an exception, let it propagate
                             # as this is most likely a programming error on
                             # the loop, not the task.
-                            current._val = actions[act[0]](*act[1:])
+                            current._val = acts[act[0]](*act[1:])
 
 
         # --- Outer loop preparation ---
@@ -639,7 +670,9 @@ class TkLoop:
                 # Wrap events callbacks with an unbind
                 with prepare_tk():
 
-                    # Outside loop
+
+                    # --- Outer loop ---
+
                     while True:
 
                         # Get coro to run
@@ -670,16 +703,6 @@ class TkLoop:
                         # Check if loop is still running
                         if getasyncgenstate(loop) == "AGEN_CLOSED":
                             raise RuntimeError("Loop was closed") from exc
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc, val, tb):
-        self.run(shutdown=True)
-
-    def __del__(self):
-        if not self._closed:
-            raise RuntimeError("TkLoop wasn't shutdown with TkLoop.run(shutdown=True)")
 
 
 def run(coro):

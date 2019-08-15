@@ -12,10 +12,11 @@ __all__ = [
     "_new_task",
     "_this_task",
     "_cancel_task",
-    "_wait_task",
-    "_get_tasks",
+    "_get_loop",
     "_add_timeout",
     "_remove_timeout",
+    "_wait_holder",
+    "_wake_holder",
 ]
 
 
@@ -39,59 +40,64 @@ def _act(*act):
 
 # Synchronous
 async def _get_time():
-    return await _act("get_time")
+    return await _act("_act_get_time")
 
 
 # Blocking
 async def _sleep(tm):
-    return await _act("sleep", tm)
+    return await _act("_act_sleep", tm)
 
 
 # Synchronous
 async def _pop_event():
-    return await _act("pop_event")
+    return await _act("_act_pop_event")
 
 
 # Blocking
 async def _wait_event():
-    return await _act("wait_event")
+    return await _act("_act_wait_event")
 
 
 # Synchronous
 async def _get_tk():
-    return await _act("get_tk")
+    return await _act("_act_get_tk")
 
 
 # Synchronous
-async def _new_task(coro, *, eventless=False):
-    return await _act("new_task", coro, eventless)
+async def _new_task(coro):
+    return await _act("_act_new_task", coro)
 
 
 # Synchronous
 async def _this_task():
-    return await _act("this_task")
+    return await _act("_act_this_task")
 
 
 # Synchronous
-async def _cancel_task(task, *, exc=TaskCancelled, val=None):
-    return await _act("cancel_task", task, exc, val)
-
-
-# Blocking
-async def _wait_task(task):
-    return await _act("wait_task", task)
+async def _cancel_task(task, exc=TaskCancelled, val=None):
+    return await _act("_act_cancel_task", task, exc, val)
 
 
 # Synchronous
-async def _get_tasks():
-    return await _act("get_tasks")
+async def _get_loop():
+    return await _act("_act_get_loop")
 
 
 # Synchronous
 async def _add_timeout(tm):
-    return await _act("add_timeout", tm)
+    return await _act("_act_add_timeout", tm)
 
 
 # Synchronous
 async def _remove_timeout(previous):
-    return await _act("remove_timeout", previous)
+    return await _act("_act_remove_timeout", previous)
+
+
+# Blocking
+async def _wait_holder(holder, state):
+    return await _act("_act_wait_holder", holder, state)
+
+
+# Synchronous
+async def _wake_holder(holder, n=1):
+    return await _act("_act_wake_holder", holder, n)

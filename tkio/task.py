@@ -29,7 +29,7 @@ class Task:
     _next_id = 0
 
 
-    def __init__(self, coro, *, eventless=False):
+    def __init__(self, coro):
 
         # Task identification
         self.id = Task._next_id
@@ -54,7 +54,7 @@ class Task:
 
         # Index of next event that will be returned next
         # Note: -1 to signify that task doesn't want events
-        self._next_event = -1 if eventless else 0
+        self._next_event = 0
 
         # Task result / exception
         self._result_val = None
@@ -62,6 +62,9 @@ class Task:
 
         # Value to send on resumation
         self._val = None
+
+        # Bound methods for coroutine
+        self._send = coro.send
 
         # Stack of timeout times
         self._deadlines = []
@@ -76,13 +79,13 @@ class Task:
 
     def __del__(self):
         self.coro.close()
-        if not any(self.joined, self.cancelled, self.daemon, self.exception):
+        if not any((self.joined, self.cancelled, self.daemon, self.exception)):
             raise RuntimeError(f"{self} wasn't joined")
 
 
     async def wait(self):
         if not self.terminated:
-            await _wait_task(self)
+            await _wait_holder(self.waiting, "TASK_WAIT")
 
 
     async def cancel(self, *, exc=TaskCancelled, blocking=True):
