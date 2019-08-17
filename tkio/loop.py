@@ -670,45 +670,45 @@ class TkLoop:
         loop = cycle = None
 
         # Wrap toplevel and loop with a context manager
-        with destroying(tkinter.Tk()) as tk:
-            with prepare_loop() as loop:
+        with contextlib.ExitStack() as stack:
+            stack_enter_context = stack.enter_context
+            tk = stack_enter_context(destroying(tkinter.Tk()))
+            loop = stack_enter_context(prepare_loop())
+            stack_enter_context(prepare_tk())
 
-                # Wrap events callbacks with an unbind
-                with prepare_tk():
 
+            # --- Outer loop ---
 
-                    # --- Outer loop ---
+            while True:
 
-                    while True:
+                # Get coro to run
+                coro = yield val, exc
+                cycle = wrap_coro(loop.asend(coro))
+                del coro
 
-                        # Get coro to run
-                        coro = yield val, exc
-                        cycle = wrap_coro(loop.asend(coro))
-                        del coro
+                # Run until frame is destroyed
+                # Note: `wait_window` will spawn in tkinter's event loop
+                # but will end when the widget is destroyed. `frame` will
+                # be destroyed when an exception happens in sending a value
+                # to the cycle.
+                with destroying(tkinter.Frame(tk)) as frame:
+                    send(cycle, None)
+                    wait_window(frame)
 
-                        # Run until frame is destroyed
-                        # Note: `wait_window` will spawn in tkinter's event loop
-                        # but will end when the widget is destroyed. `frame` will
-                        # be destroyed when an exception happens in sending a value
-                        # to the cycle.
-                        with destroying(tkinter.Frame(tk)) as frame:
-                            send(cycle, None)
-                            wait_window(frame)
+                # Check if cycle has closed
+                if inspect.getcoroutinestate(cycle) != "CORO_CLOSED":
+                    cycle.close()
+                    raise RuntimeError(
+                        "frame closed before main coro finished"
+                    ) from exc
 
-                        # Check if cycle has closed
-                        if inspect.getcoroutinestate(cycle) != "CORO_CLOSED":
-                            cycle.close()
-                            raise RuntimeError(
-                                "frame closed before main coro finished"
-                            ) from exc
+                # Check if toplevel exists
+                if not exists(tk):
+                    raise RuntimeError("Toplevel was destroyed") from exc
 
-                        # Check if toplevel exists
-                        if not exists(tk):
-                            raise RuntimeError("Toplevel was destroyed") from exc
-
-                        # Check if loop is still running
-                        if getasyncgenstate(loop) == "AGEN_CLOSED":
-                            raise RuntimeError("Loop was closed") from exc
+                # Check if loop is still running
+                if getasyncgenstate(loop) == "AGEN_CLOSED":
+                    raise RuntimeError("Loop was closed") from exc
 
 
 def run(coro):
