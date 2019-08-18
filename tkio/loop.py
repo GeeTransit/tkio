@@ -484,9 +484,8 @@ class TkLoop:
 
         @tkinter_callback
         def close_window():
-            for task in tasks.values():
-                cancel_task(task, exc=CloseWindow("X was pressed"))
-            safe_send(cycle, "CLOSE_WINDOW")
+            if event_wait:
+                safe_send(cycle, "CLOSE_WINDOW")
 
 
         # --- Outer loop helper functions ---
@@ -580,15 +579,26 @@ class TkLoop:
                     for task in event_wait.popall():
                         reschedule(task)
 
+                elif info == "CLOSE_WINDOW":
+                    for task in event_wait.popall():
+                        cancel_task(task, exc=CloseWindow("X was pressed"))
+
                 # check for amount of events that have been consumed by all event tasks
-                event_tasks = [task for task in tasks.values() if task.next_event != -1]
+                event_tasks = [task for task in tasks.values() if task.next_event >= 0]
                 if event_tasks:
-                    leftover = min(task.next_event for task in event_tasks)
-                    if leftover:
-                        for _ in range(leftover):
+                    offset = min(task.next_event for task in event_tasks)
+                    if offset:
+                        for _ in range(offset):
                             event_queue.popleft()
                         for task in event_tasks:
-                            task.next_event -= leftover
+                            task.next_event -= offset
+                # Clear the queue if there aren't any tasks to collect events
+                # Note: This will leave at most 50 events on the queue.
+                elif len(event_queue) > 50:
+                    offset = len(event_queue) - 50
+                    logger.info("Clearing %s events from event queue.", offset)
+                    for _ in range(offset):
+                        event_queue.popleft()
 
                 # Wake sleeps and timeouts here
                 now = time_monotonic()
