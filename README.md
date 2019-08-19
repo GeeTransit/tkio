@@ -1,5 +1,15 @@
-tkio - asynchronous tkinter
-===========================
+tkio - asynchronous tkinter (inactive)
+======================================
+
+Note:
+-----
+
+This repository will not be updated and will be replaced by Guio.
+Guio is a library that supplies an alternative Curio kernel that
+is designed for tkinter.
+
+Description:
+------------
 
 Tkio is a library for asynchronous code that works with tkinter. As
 tkinter doesn't like working in multiple threads, multitasking in a
