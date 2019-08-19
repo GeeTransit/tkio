@@ -4,6 +4,7 @@ import functools
 import inspect
 import logging
 import operator
+import selectors
 import time
 import tkinter
 import types
@@ -52,20 +53,26 @@ class TkLoop:
     )
 
 
-    def __init__(self):
+    def __init__(self, *, selector=None):
 
-        # Loop runner state
-        self._runner = None
-        self._closed = False
+        # Functions to run at shutdown
+        self._shutdown_funcs = []
+
+        # Selector initiation
+        self._selector = (selector if selector else selectors.DefaultSelector())
+        self._call_at_shutdown(self._selector.close)
 
         # Task and act dicts
         self._tasks = {}
         self._acts = {}
 
+        # Loop runner
+        self._runner = None
+
         # Ready tasks to be run
         self._ready_tasks = collections.deque()
 
-        # Events received by tkinter (and not all consumed)
+        # Events received by tkinter (and aren't read by all tasks yet)
         self._event_queue = collections.deque()
 
         # Holders for event and time based waiting
@@ -73,18 +80,22 @@ class TkLoop:
         self._time_wait = collections.defaultdict(SetHolder)
 
 
+    def __del__(self):
+        if self._shutdown_funcs is not None:
+            raise RuntimeError("TkLoop wasn't shutdown with TkLoop.run(shutdown=True)")
+
+
     def __enter__(self):
         return self
 
 
     def __exit__(self, exc, val, tb):
-        if not self._closed:
+        if self._shutdown_funcs is not None:
             self.run(shutdown=True)
 
 
-    def __del__(self):
-        if not self._closed:
-            raise RuntimeError("TkLoop wasn't shutdown with TkLoop.run(shutdown=True)")
+    def _call_at_shutdown(self, func):
+        self._shutdown_funcs.append(func)
 
 
     def run(self, coro=None, *, shutdown=False):
@@ -92,7 +103,8 @@ class TkLoop:
         if self._closed:
             raise RuntimeError("loop already shut down")
 
-        if not self._runner:
+        # Create a new runner if needed
+        if not self._runner or not self._runner.gi_frame:
             self._runner = self._run_coro()
             try:
                 self._runner.send(None)
@@ -101,39 +113,42 @@ class TkLoop:
                 self._closed = True
                 raise TkLoopError("Loop failed to initialize") from e
 
-        if shutdown:
-            if coro:
-                raise ValueError("Cannot supply `coro` and `shutdown` in same call")
+        val = exc = None
 
+        if coro or not shutdown:
+            try:
+                val, exc = self._runner.send(coro)
+            except BaseException as e:
+                raise TkLoopError("Loop exited with error") from e
+
+        if shutdown:
             async def shutdown_coro(tasks):
                 for task in tasks:
                     await task.cancel(blocking=False)
 
-            try:
-                while self._tasks:
-                    self._runner.send(shutdown_coro(self._tasks.values()))
-            except BaseException:
-                pass
+            while self._tasks:
+                self._runner.send(shutdown_coro(self._tasks.values()))
 
             self._runner.close()
-            self._closed = True
+            self._runner = None
 
+            for func in self._shutdown_funcs:
+                 func()
+            self._shutdown_funcs = None
+
+        if exc:
+            raise exc
         else:
-            try:
-                val, exc = self._runner.send(coro)
-
-            except BaseException as e:
-                self._runner.close()
-                self._closed = True
-                raise TkLoopError("Loop exited with error") from e
-
-            else:
-                if exc:
-                    raise exc
-                return val
+            return val
 
 
     def _run_coro(self):
+
+
+        # --- Constants ---
+
+        EVENT_READ = selectors.EVENT_READ
+        EVENT_WRITE = selectors.EVENT_WRITE
 
 
         # --- Loop states ---
@@ -147,6 +162,7 @@ class TkLoop:
         # Rebindings from loop
         tasks = self._tasks                 # Mapping of task id to task
         acts = self._acts                   # Mapping of trap name to function
+        selector = self._selector           # Kernel selector for I/O
         ready_tasks = self._ready_tasks     # Deque of tasks ready to be run
         event_queue = self._event_queue     # Deque of waiting events
         event_wait = self._event_wait       # Holder for event waiting
@@ -154,6 +170,13 @@ class TkLoop:
 
 
         # --- Bound methods ---
+
+        selector_register = selector.register
+        selector_unregister = selector.unregister
+        selector_modify = selector.modify
+        selector_select = selector.select
+        selector_getkey = selector.get_key
+        selector_getmap = selector.get_map
 
         ready_tasks_append = ready_tasks.append
         ready_tasks_popleft = ready_tasks.popleft
@@ -211,26 +234,63 @@ class TkLoop:
             reschedule(task, task.cancel_pending)
             task.cancel_pending = None
 
-        def add_timeout(tm, ty):
-
-            # Save current task for a reset later
-            task = current
-
-            time_remove = time_wait[tm].add((task, ty))
-
-            previous = getattr(task, ty)
-
+        def add_timeout(tm, ty, task):
             # Update task state if `tm` is now the earliest one
+            previous = getattr(task, ty)
             if previous is None or tm <= previous:
                 setattr(task, ty, tm)
 
-            # Function that removes time and returns the previous state
-            def _remove_func():
-                setattr(task, ty, previous)
-                time_remove()
-                return previous
+            # Set timeout and get removing function
+            remove = time_wait[tm].add((task, ty))
 
-            return _remove_func
+            # Return function that removes time and returns the previous state
+            return (lambda: remove_timeout(previous, ty, task, remove))
+
+        # Helper function for `add_timeout`
+        def remove_timeout(previous, ty, task, remove):
+            setattr(task, ty, previous)
+            remove()
+            return previous
+
+        def register_event(fileobj, event, task):
+            try:
+                key = selector_getkey(fileobj)
+
+            except KeyError:
+                data = ((task, None) if event == EVENT_READ else (None, task))
+                selector_register(fileobj, event, data)
+
+            else:
+                mask = key.events
+                rtask, wtask = key.data
+
+                if event == EVENT_READ and rtask:
+                    raise RuntimeError(
+                        "Multiple tasks cannot wait to read on "
+                        f"the same file descriptor {fileobj}"
+                    )
+                if event == EVENT_WRITE and wtask:
+                    raise RuntimeError(
+                        "Multiple tasks cannot wait to write on "
+                        f"the same file descriptor {fileobj}"
+                    )
+
+                data = ((task, wtask) if event == EVENT_READ else (rtask, task))
+                selector_modify(fileobj, mask|event, data)
+
+            return (lambda: unregister_event(fileobj, event))
+
+        # Helper function for `register_event`
+        def unregister_event(fileobj, event):
+            key = selector_getkey(fileobj)
+            mask = key.events
+            rtask, wtask = key.data
+            mask &= ~event
+            if not mask:
+                selector_unregister(fileobj)
+            else:
+                data = ((None, wtask) if event == EVENT_READ else (rtask, None))
+                selector_modify(fileobj, mask, data)
 
 
         # --- Act decorators ---
@@ -277,7 +337,7 @@ class TkLoop:
             else:
                 if not absolute:
                     tm += time_monotonic()
-                suspend_current("SLEEP", add_timeout(tm, "sleep"))
+                suspend_current("SLEEP", add_timeout(tm, "sleep", current))
 
         @event_act
         def _act_pop_event():
@@ -313,7 +373,7 @@ class TkLoop:
             return self
 
         def _act_add_timeout(tm):
-            return add_timeout(tm, "timeout")
+            return add_timeout(tm, "timeout", current)
 
         def _act_remove_timeout(remove_func):
             now = time_monotonic()
@@ -333,6 +393,21 @@ class TkLoop:
         def _act_wake_holder(holder, n):
             for _ in range(n):
                 reschedule(holder.pop())
+
+        @blocking_act
+        def _act_io(fileobj, event, state):
+            suspend_current(state, register_event(fileobj, event))
+
+        def _act_io_waiting(fileobj):
+            try:
+                key = selector_getkey(fileobj)
+            except KeyError:
+                return (None, None)
+            else:
+                rtask, wtask = key.data
+                rtask = (rtask if rtask and rtask.cancel_func else None)
+                wtask = (wtask if wtask and wtask.cancel_func else None)
+                return (rtask, wtask)
 
         # Mapping of act name to function
         acts = self._acts = {
@@ -424,13 +499,16 @@ class TkLoop:
         # Ensure a resumation of the cycle if required
         @contextlib_contextmanager
         def after_call():
-            if ready_tasks or time_wait:
+            if ready_tasks or time_wait or selector_getmap():
                 if ready_tasks:
                     timeout = 0
                     data = "READY"
                 elif time_wait:
                     timeout = (min(time_wait) - time_monotonic()) * 1000
                     data = "SLEEP_WAKE"
+                else:
+                    timeout = 0
+                    data = "SELECT"
 
                 id_ = frame.after(max(int(timeout), 1), lambda: safe_send(cycle, data))
 
@@ -592,6 +670,7 @@ class TkLoop:
                             event_queue.popleft()
                         for task in event_tasks:
                             task.next_event -= offset
+
                 # Clear the queue if there aren't any tasks to collect events
                 # Note: This will leave at most 50 events on the queue.
                 elif len(event_queue) > 50:
@@ -600,7 +679,35 @@ class TkLoop:
                     for _ in range(offset):
                         event_queue.popleft()
 
+                # Do a poll for events (if needed)
+                if selector_getmap():
+
+                    # Not blocking call to poll for events
+                    events = selector_select(0)
+
+                    # Reschedule events
+                    for key, mask in events:
+                        rtask, wtask = key.data
+
+                        if mask & EVENT_READ:
+                            reschedule(rtask)
+                            mask &= ~EVENT_READ
+                            rtask = None
+
+                        if mask & EVENT_WRITE:
+                            reschedule(wtask)
+                            mask &= ~EVENT_WRITE
+                            wtask = None
+
+                        if mask:
+                            selector_modify(key.fileobj, mask, (rtask, wtask))
+                        else:
+                            selector_unregister(key.fileobj)
+
                 # Wake sleeps and timeouts here
+                # Note: We do timeouts here as the previous actions may
+                # reschedule a task that has hit a timeout. We'll let the
+                # task run and set a pending exception.
                 now = time_monotonic()
                 for tm in list(time_wait.keys()):
 
@@ -619,8 +726,6 @@ class TkLoop:
                             reschedule(task, now)
                         else:
                             cancel_task(task, exc=TaskTimeout(f"Task timed out at {now}"))
-
-                # Add socket / selectors stuff here
 
                 # Run all ready tasks
                 for _ in range(len(ready_tasks)):

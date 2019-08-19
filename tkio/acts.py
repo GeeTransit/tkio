@@ -1,3 +1,4 @@
+from selectors import EVENT_READ, EVENT_WRITE
 from types import coroutine
 
 from .exceptions import TaskCancelled
@@ -101,3 +102,18 @@ async def _wait_holder(holder, state):
 # Synchronous
 async def _wake_holder(holder, n=1):
     return await _act("_act_wake_holder", holder, n)
+
+
+# Blocking
+async def _read_wait(fileobj):
+    return await _act("_act_io", fileobj, EVENT_READ, "READ_WAIT")
+
+
+# Blocking
+async def _write_wait(fileobj):
+    return await _act("_act_io", fileobj, EVENT_WRITE, "WRITE_WAIT")
+
+
+# Synchronous
+async def _io_waiting(holder, n=1):
+    return await _act("_act_io_waiting", holder, n)
